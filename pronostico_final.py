@@ -1,10 +1,10 @@
 # ==============================================================================
-# SCRIPT DEFINITIVO CON REPORTE DE CALIBRACIÓN Y BACKTEST FINAL (VERSIÓN ROBUSTA)
+# SCRIPT DEFINITIVO CON REPORTE DE CALIBRACIÓN Y BACKTEST FINAL (VERSIÓN CSV)
 # ==============================================================================
+# - Versión final que lee datos 100% desde archivos CSV locales para consistencia.
 # - Carga el modelo y los hiperparámetros ganadores desde 'champion_model.json'.
-# - Incluye un parser para validar y corregir tipos de datos de los parámetros.
-# - Valida la calibración actual del modelo y se recalibra si es necesario.
-# - Genera un backtest gráfico y un pronóstico final con múltiples rangos de probabilidad.
+# - Valida y recalibra el modelo si es necesario.
+# - Genera un backtest gráfico y un pronóstico final con múltiples rangos.
 # ==============================================================================
 
 import pandas as pd
@@ -13,7 +13,6 @@ import lightgbm as lgb
 import logging
 from datetime import datetime
 from tqdm import tqdm
-import yfinance as yf
 import matplotlib.pyplot as plt
 import warnings
 import json
@@ -31,19 +30,30 @@ logging.basicConfig(
 )
 
 def actualizar_datos():
-    """Descarga los datos más recientes de SPY y VIX desde Yahoo Finance."""
-    logging.info("Paso 1: Descargando datos actualizados de SPY y ^VIX...")
+    """
+    MODIFICADO: Carga los datos más recientes desde los archivos CSV locales.
+    Asegúrate de que esta función lea el mismo archivo maestro que el script de optimización.
+    """
+    logging.info("Paso 1: Cargando datos actualizados desde archivos CSV locales...")
     try:
-        spy_df = yf.download('SPY', start='2009-01-01', progress=False, auto_adjust=True)
-        vix_df = yf.download('^VIX', start='2009-01-01', progress=False, auto_adjust=True)
-        merged_df = pd.merge(spy_df[['Open', 'High', 'Low', 'Close']], vix_df[['Close']],
+        # **IMPORTANTE**: Usa los mismos nombres de archivo que tu script de optimización.
+        # Asumiendo los nombres 'spy_15y_daily.csv' y 'vix_15y_daily.csv'
+        spy_df = pd.read_csv('spy_15y_daily_20250909.csv', index_col='date', parse_dates=True)
+        vix_df = pd.read_csv('vix_15y_daily_20250909.csv', index_col='date', parse_dates=True)
+        
+        # Unimos los dataframes. Asumiendo que las columnas son 'open', 'high', 'low', 'close'
+        merged_df = pd.merge(spy_df[['open', 'high', 'low', 'close']], vix_df[['close']],
                              left_index=True, right_index=True, suffixes=('_SPY', '_VIX'))
-        merged_df.columns = ['open', 'high', 'low', 'close', 'vix_level']
+        
+        # Renombramos las columnas para que coincidan con el resto del script
+        merged_df.rename(columns={'close_SPY': 'close', 'close_VIX': 'vix_level'}, inplace=True)
         merged_df['returns'] = np.log(merged_df['close']).diff()
-        logging.info(f"Datos cargados exitosamente. Último registro: {merged_df.index[-1].date()}")
+        
+        logging.info(f"Datos cargados exitosamente desde CSV. Último registro: {merged_df.index[-1].date()}")
         return merged_df.dropna()
-    except Exception as e:
-        logging.error(f"Error crítico al descargar datos: {e}")
+    except FileNotFoundError as e:
+        logging.error(f"Error crítico al cargar archivos de datos: {e}")
+        logging.error("Asegúrate de que 'spy_15y_daily.csv' y 'vix_15y_daily.csv' existan en el directorio.")
         raise
 
 def preparar_datos_y_features(df):
@@ -67,7 +77,7 @@ def preparar_datos_y_features(df):
     features_to_check = features_df.columns.drop(['target_lower_pct', 'target_upper_pct'])
     return features_df.dropna(subset=features_to_check)
 
-# --- FUNCIONES DE MODELADO, PRONÓSTICO Y GRÁFICOS ---
+# --- FUNCIONES DE MODELADO, PRONÓSTICO Y GRÁFICOS (Sin cambios) ---
 def entrenar_modelos(features_df, quantiles, model_params):
     """Entrena los modelos LGBM finales con los datos más recientes."""
     train_df = features_df.dropna(subset=['target_lower_pct', 'target_upper_pct'])
@@ -119,7 +129,6 @@ def graficar_pronostico_avanzado(latest_data, forecast_bounds, history_df, quant
     plt.savefig('pronostico_avanzado_actual.png', dpi=300)
     plt.show()
 
-# --- FUNCIONES DE BACKTEST Y CALIBRACIÓN ---
 def ejecutar_backtest(features_df, quantiles_a_probar, model_params, desc=""):
     """Función central para ejecutar backtests."""
     results_data = []
@@ -171,7 +180,7 @@ if __name__ == '__main__':
         logging.info("🚀 INICIANDO SCRIPT DE PRONÓSTICO CON AUTO-OPTIMIZACIÓN")
         logging.info("==================================================")
 
-        # --- CARGAR PARÁMETROS DEL CAMPEÓN DESDE EL ARCHIVO JSON ---
+        # Carga el modelo campeón desde el archivo JSON
         try:
             with open('champion_model.json', 'r') as f:
                 PARAMETROS_CAMPEONES = json.load(f)
@@ -180,8 +189,7 @@ if __name__ == '__main__':
             logging.error("❌ No se encontró el archivo 'champion_model.json'. Ejecuta primero el script de optimización.")
             raise
         
-        # --- PARSER DE VALIDACIÓN Y CORRECCIÓN DE TIPOS ---
-        # Este bloque hace que el script sea resistente a tipos de datos incorrectos en el JSON.
+        # Parser de validación y corrección de tipos
         logging.info("Validando y corrigiendo tipos de datos de los parámetros...")
         params_dict = PARAMETROS_CAMPEONES['params']
         int_params = ['n_estimators', 'num_leaves', 'max_depth', 'min_samples_leaf', 'epochs', 'batch_size']
@@ -195,13 +203,13 @@ if __name__ == '__main__':
         merged_data = actualizar_datos()
         features_data = preparar_datos_y_features(merged_data)
         
-        # --- ETAPA 1: VALIDACIÓN ---
+        # ETAPA 1: VALIDACIÓN
         logging.info(f"--- FASE 1: VALIDANDO PARÁMETROS ACTUALES: {PARAMETROS_CAMPEONES['params']} ---")
         df_validacion = ejecutar_backtest(features_data, [tuple(PARAMETROS_CAMPEONES['quantiles'])], PARAMETROS_CAMPEONES['params'], desc="Validando Parámetros Actuales")
         breach_pct_actual = df_validacion['breach_pct'].iloc[0]
         logging.info(f"Tasa de ruptura (Breach Rate) actual: {breach_pct_actual:.2f}%")
         
-        # --- ETAPA 2: AUTO-CALIBRACIÓN ---
+        # ETAPA 2: AUTO-CALIBRACIÓN
         parametros_finales = tuple(PARAMETROS_CAMPEONES['quantiles'])
         if not (RANGO_ACEPTABLE_RUPTURAS[0] <= breach_pct_actual <= RANGO_ACEPTABLE_RUPTURAS[1]):
             logging.warning(f"⚠️ ¡Alerta de Calibración! Iniciando recalibración automática...")
@@ -216,7 +224,7 @@ if __name__ == '__main__':
         else:
             logging.info("✅ Validación exitosa. El modelo está bien calibrado.")
 
-        # --- ETAPA 3: BACKTEST FINAL Y GRÁFICO ---
+        # ETAPA 3: BACKTEST FINAL Y GRÁFICO
         logging.info(f"--- FASE 3: BACKTEST FINAL CON CUANTILES {parametros_finales} ---")
         df_backtest_final = ejecutar_backtest(features_data, [parametros_finales], PARAMETROS_CAMPEONES['params'], desc="Ejecutando Backtest Final").iloc[0]
         graficar_backtest(df_backtest_final['backtest_df'],
@@ -224,16 +232,12 @@ if __name__ == '__main__':
                           merged_data,
                           f"Backtest Final (24 Meses) con Cuantiles {parametros_finales}\nTasa de Ruptura (Breach Rate): {df_backtest_final['breach_pct']:.2f}%")
 
-        # --- ETAPA 4: PRONÓSTICO FINAL ---
+        # ETAPA 4: PRONÓSTICO FINAL
         logging.info(f"--- FASE 4: GENERANDO PRONÓSTICO FINAL CON CUANTILES {parametros_finales} ---")
         
         QUANTILES_A_PREDECIR = sorted(list(set([
             parametros_finales[0], parametros_finales[1],
-            0.05, 0.95,   # Rango 90%
-            0.075, 0.925, # Rango 85%
-            0.10, 0.90,   # Rango 80%
-            0.125, 0.875, # Rango 75%
-            0.15, 0.85    # Rango 70%
+            0.05, 0.95, 0.075, 0.925, 0.10, 0.90, 0.125, 0.875, 0.15, 0.85
         ])))
         
         trained_models = entrenar_modelos(features_data.tail(504 + 21), QUANTILES_A_PREDECIR, PARAMETROS_CAMPEONES['params'])
