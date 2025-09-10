@@ -1,0 +1,10 @@
+lightgbm
+matplotlib
+numpy
+pandas
+scikit-learn
+seaborn
+tensorflow
+tqdm
+xgboost
+yfinance
