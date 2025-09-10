@@ -1,9 +1,9 @@
 # ==============================================================================
-# SCRIPT DEFINITIVO CON REPORTE DE CALIBRACIÓN Y BACKTEST FINAL (VERSIÓN MEJORADA)
+# SCRIPT DEFINITIVO CON REPORTE DE CALIBRACIÓN Y BACKTEST FINAL (VERSIÓN ROBUSTA)
 # ==============================================================================
 # - Carga el modelo y los hiperparámetros ganadores desde 'champion_model.json'.
-# - Valida la calibración actual del modelo.
-# - Se recalibra automáticamente si el rendimiento se desvía.
+# - Incluye un parser para validar y corregir tipos de datos de los parámetros.
+# - Valida la calibración actual del modelo y se recalibra si es necesario.
 # - Genera un backtest gráfico y un pronóstico final con múltiples rangos de probabilidad.
 # ==============================================================================
 
@@ -102,7 +102,6 @@ def graficar_pronostico_avanzado(latest_data, forecast_bounds, history_df, quant
     plt.figure(figsize=(18, 9))
     plt.plot(history_df.index[-180:], history_df['close'][-180:], label='Precio Histórico SPY', color='black', linewidth=2)
     
-    # Lista de colores expandida para más rangos
     colors = ['#1f77b4', '#ff7f0e', '#2ca02c', '#d62728', '#9467bd', '#8c564b']
     
     num_ranges = len(quantiles) // 2
@@ -111,7 +110,6 @@ def graficar_pronostico_avanzado(latest_data, forecast_bounds, history_df, quant
         conf_level = (upper_q - lower_q) * 100
         lower_bound, upper_bound = forecast_bounds[lower_q], forecast_bounds[upper_q]
         label_text = f'Rango {conf_level:.0f}% (${lower_bound:.2f} - ${upper_bound:.2f})'
-        # Usamos i % len(colors) para evitar errores si hay más rangos que colores
         plt.fill_between(future_dates, lower_bound, upper_bound, color=colors[i % len(colors)], alpha=0.2, label=label_text)
         plt.hlines(y=[lower_bound, upper_bound], xmin=future_dates[0], xmax=future_dates[-1], colors=colors[i % len(colors)], linestyles='--')
         
@@ -182,6 +180,16 @@ if __name__ == '__main__':
             logging.error("❌ No se encontró el archivo 'champion_model.json'. Ejecuta primero el script de optimización.")
             raise
         
+        # --- PARSER DE VALIDACIÓN Y CORRECCIÓN DE TIPOS ---
+        # Este bloque hace que el script sea resistente a tipos de datos incorrectos en el JSON.
+        logging.info("Validando y corrigiendo tipos de datos de los parámetros...")
+        params_dict = PARAMETROS_CAMPEONES['params']
+        int_params = ['n_estimators', 'num_leaves', 'max_depth', 'min_samples_leaf', 'epochs', 'batch_size']
+        for param in int_params:
+            if param in params_dict and isinstance(params_dict[param], float):
+                logging.warning(f"Parámetro '{param}' era flotante ({params_dict[param]}). Convirtiendo a entero.")
+                params_dict[param] = int(params_dict[param])
+        
         RANGO_ACEPTABLE_RUPTURAS = (2.0, 8.0)
         
         merged_data = actualizar_datos()
@@ -219,20 +227,13 @@ if __name__ == '__main__':
         # --- ETAPA 4: PRONÓSTICO FINAL ---
         logging.info(f"--- FASE 4: GENERANDO PRONÓSTICO FINAL CON CUANTILES {parametros_finales} ---")
         
-        # Lista de cuantiles actualizada para más rangos en el gráfico
         QUANTILES_A_PREDECIR = sorted(list(set([
-            # Rango 97% (viene de los parámetros finales)
             parametros_finales[0], parametros_finales[1],
-            # Rango 90%
-            0.05, 0.95,
-            # Rango 85%
-            0.075, 0.925,
-            # Rango 80%
-            0.10, 0.90,
-            # Rango 75%
-            0.125, 0.875,
-            # Rango 70%
-            0.15, 0.85
+            0.05, 0.95,   # Rango 90%
+            0.075, 0.925, # Rango 85%
+            0.10, 0.90,   # Rango 80%
+            0.125, 0.875, # Rango 75%
+            0.15, 0.85    # Rango 70%
         ])))
         
         trained_models = entrenar_modelos(features_data.tail(504 + 21), QUANTILES_A_PREDECIR, PARAMETROS_CAMPEONES['params'])
