@@ -1,9 +1,10 @@
 # ==============================================================================
-# SCRIPT DE OPTIMIZACIÓN AVANZADA (VERSIÓN CON OPTUNA Y ENSAMBLE)
+# SCRIPT DE OPTIMIZACIÓN v3 (CON 4 MODELOS DE ÁRBOLES + 1 LINEAL)
 # ==============================================================================
-# - Usa Optimización Bayesiana (Optuna) para una búsqueda eficiente.
-# - Implementa análisis de importancia de features con SHAP.
-# - Selecciona un ensamble de los 2 mejores modelos en lugar de un único campeón.
+# - Compara 5 modelos robustos: LightGBM, XGBoost, RandomForest,
+#   GradientBoostingRegressor y QuantileRegressor.
+# - Separa los datos para que la optimización solo se realice en el
+#   conjunto de entrenamiento/validación.
 # ==============================================================================
 
 import pandas as pd
@@ -11,15 +12,12 @@ import numpy as np
 import logging
 import warnings
 import json
-import ast
-from tqdm import tqdm
-import shap
-import matplotlib.pyplot as plt
 
 # Imports de Modelos y Herramientas
 import lightgbm as lgb
 import xgboost as xgb
-from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor
+from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor ## NUEVO ##
+from sklearn.linear_model import QuantileRegressor
 import optuna
 
 # --- CONFIGURACIÓN ---
@@ -27,12 +25,12 @@ warnings.filterwarnings('ignore')
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 optuna.logging.set_verbosity(optuna.logging.WARNING)
 
-# --- PREPARACIÓN DE DATOS ---
+# --- PREPARACIÓN DE DATOS (sin cambios) ---
 def actualizar_datos():
     logging.info("Paso 1: Cargando datos...")
     try:
         spy_df = pd.read_csv('spy_15y_daily_20250912.csv', index_col='date', parse_dates=True)
-        vix_df = pd.read_csv('vix_15y_daily_20250912.csv', index_col='date', parse_dates=True) # Asumiendo que tienes este archivo
+        vix_df = pd.read_csv('vix_15y_daily_20250912.csv', index_col='date', parse_dates=True)
         merged_df = pd.merge(spy_df[['open', 'high', 'low', 'close']], vix_df[['close']], left_index=True, right_index=True, suffixes=('_SPY', '_VIX'))
         merged_df.rename(columns={'close_SPY': 'close', 'close_VIX': 'vix_level'}, inplace=True)
         merged_df['returns_SPY'] = np.log(merged_df['close']).diff()
@@ -52,8 +50,6 @@ def preparar_datos_y_features(df):
     features_df['momentum_21d'] = features_df['close'].pct_change(21)
     features_df['momentum_63d'] = features_df['close'].pct_change(63)
     features_df['momentum_126d'] = features_df['close'].pct_change(126)
-    
-    ## NUEVA MEJORA: FEATURE DE INTERACCIÓN ##
     features_df['vix_vol_ratio'] = features_df['vix_level'] / (features_df['volatility_21d'] * 100 * np.sqrt(252))
     features_df['vix_vol_ratio'].replace([np.inf, -np.inf], np.nan, inplace=True)
 
@@ -100,7 +96,25 @@ def evaluar_combinacion(features_df, nombre_modelo, params, quantiles):
             model_lower = xgb.XGBRegressor(objective='reg:quantileerror', quantile_alpha=lower_q, **train_params).fit(X_train_df, y_train_lower)
             model_upper = xgb.XGBRegressor(objective='reg:quantileerror', quantile_alpha=upper_q, **train_params).fit(X_train_df, y_train_upper)
             lower_pct_pred, upper_pct_pred = model_lower.predict(X_test_df)[0], model_upper.predict(X_test_df)[0]
-        # ... (código para otros modelos se mantiene igual)
+        
+        ## NUEVO: Lógica para RandomForest ##
+        elif nombre_modelo == 'RandomForest':
+            # RandomForest no tiene un objetivo de cuantil nativo. Se entrenan dos modelos separados.
+            model_lower = RandomForestRegressor(random_state=42, **train_params).fit(X_train_df, y_train_lower)
+            model_upper = RandomForestRegressor(random_state=42, **train_params).fit(X_train_df, y_train_upper)
+            lower_pct_pred, upper_pct_pred = model_lower.predict(X_test_df)[0], model_upper.predict(X_test_df)[0]
+
+        ## NUEVO: Lógica para GradientBoosting ##
+        elif nombre_modelo == 'GradientBoosting':
+            # GradientBoosting sí soporta cuantiles a través del parámetro 'loss'.
+            model_lower = GradientBoostingRegressor(loss='quantile', alpha=lower_q, random_state=42, **train_params).fit(X_train_df, y_train_lower)
+            model_upper = GradientBoostingRegressor(loss='quantile', alpha=upper_q, random_state=42, **train_params).fit(X_train_df, y_train_upper)
+            lower_pct_pred, upper_pct_pred = model_lower.predict(X_test_df)[0], model_upper.predict(X_test_df)[0]
+            
+        elif nombre_modelo == 'QuantileRegressor':
+            model_lower = QuantileRegressor(quantile=lower_q, solver='highs', **train_params).fit(X_train_df, y_train_lower)
+            model_upper = QuantileRegressor(quantile=upper_q, solver='highs', **train_params).fit(X_train_df, y_train_upper)
+            lower_pct_pred, upper_pct_pred = model_lower.predict(X_test_df)[0], model_upper.predict(X_test_df)[0]
 
         lower_bound, upper_bound = current_price * (1 + lower_pct_pred), current_price * (1 + upper_pct_pred)
         actual_max_price, actual_min_price = test_df['close'].max(), test_df['close'].min()
@@ -114,49 +128,55 @@ def evaluar_combinacion(features_df, nombre_modelo, params, quantiles):
     breach_percentage = (breaches / len(test_dates)) * 100 if len(test_dates) > 0 else 0
     max_error_pct = np.max(breach_magnitudes) * 100 if breach_magnitudes else 0
     
-    # Métrica de penalización para Optuna
     target_breach_rate = (quantiles[0] + (1 - quantiles[1])) * 100
-    score = abs(breach_percentage - target_breach_rate) + (max_error_pct / 10) # Penaliza errores grandes
-    if max_error_pct > 20.0: score += 100 # Penalización dura
+    score = abs(breach_percentage - target_breach_rate) + (max_error_pct / 10)
+    if max_error_pct > 20.0: score += 100
 
     return score, breach_percentage, max_error_pct
-
-## NUEVA MEJORA: FUNCIÓN PARA SHAP ##
-def analizar_importancia_features(modelo, X_train, nombre_modelo):
-    logging.info(f"Generando análisis SHAP para {nombre_modelo}...")
-    explainer = shap.TreeExplainer(modelo)
-    shap_values = explainer.shap_values(X_train)
-    
-    plt.figure()
-    shap.summary_plot(shap_values, X_train, plot_type="bar", show=False)
-    plt.title(f'Importancia de Features (SHAP) - {nombre_modelo}')
-    plt.tight_layout()
-    plt.savefig(f'shap_importance_{nombre_modelo}.png', dpi=150)
-    plt.close()
-
 
 # --- ORQUESTADOR PRINCIPAL ---
 if __name__ == '__main__':
     PARAMETROS_QUANTILES_OPTIMOS = (0.015, 0.985)
-    N_TRIALS_OPTUNA = 50 # Número de iteraciones para la búsqueda
+    N_TRIALS_OPTUNA = 50 
+    FECHA_CORTE_ENTRENAMIENTO = '2023-12-31'
 
     def objective_factory(model_name, features_df):
         def objective(trial):
             if model_name == 'LightGBM':
                 params = {
                     'n_estimators': trial.suggest_int('n_estimators', 100, 500),
-                    'learning_rate': trial.suggest_float('learning_rate', 0.01, 0.2),
+                    'learning_rate': trial.suggest_float('learning_rate', 0.01, 0.2, log=True),
                     'num_leaves': trial.suggest_int('num_leaves', 20, 60),
                 }
             elif model_name == 'XGBoost':
                 params = {
                     'n_estimators': trial.suggest_int('n_estimators', 100, 500),
-                    'learning_rate': trial.suggest_float('learning_rate', 0.01, 0.2),
+                    'learning_rate': trial.suggest_float('learning_rate', 0.01, 0.2, log=True),
                     'max_depth': trial.suggest_int('max_depth', 3, 7),
                 }
-            # ... (definir espacios de búsqueda para RF y GBR)
+            
+            ## NUEVO: Espacio de búsqueda para RandomForest ##
+            elif model_name == 'RandomForest':
+                params = {
+                    'n_estimators': trial.suggest_int('n_estimators', 100, 500),
+                    'max_depth': trial.suggest_int('max_depth', 5, 15),
+                    'min_samples_leaf': trial.suggest_int('min_samples_leaf', 5, 20),
+                }
+
+            ## NUEVO: Espacio de búsqueda para GradientBoosting ##
+            elif model_name == 'GradientBoosting':
+                params = {
+                    'n_estimators': trial.suggest_int('n_estimators', 100, 500),
+                    'learning_rate': trial.suggest_float('learning_rate', 0.01, 0.2, log=True),
+                    'max_depth': trial.suggest_int('max_depth', 3, 7),
+                }
+
+            elif model_name == 'QuantileRegressor':
+                params = {
+                    'alpha': trial.suggest_float('alpha', 1e-5, 1.0, log=True)
+                }
             else:
-                params = {} # Placeholder
+                params = {}
 
             score, _, _ = evaluar_combinacion(features_df, model_name, params, PARAMETROS_QUANTILES_OPTIMOS)
             return score
@@ -166,65 +186,52 @@ if __name__ == '__main__':
     if merged_data is not None:
         features_data = preparar_datos_y_features(merged_data)
         
-        modelos_a_probar = ["LightGBM", "XGBoost"] # "RandomForest", "GradientBoosting"
+        features_data_train_val = features_data.loc[features_data.index <= FECHA_CORTE_ENTRENAMIENTO]
+        logging.info(f"Optimización se realizará con datos hasta {FECHA_CORTE_ENTRENAMIENTO}")
+        
+        ## MODIFICADO: Lista completa de modelos a probar ##
+        modelos_a_probar = ["LightGBM", "XGBoost", "RandomForest", "GradientBoosting", "QuantileRegressor"]
         campeones_de_cada_modelo = []
 
+        # (El resto del script de optimización y guardado no necesita cambios)
         for nombre_modelo in modelos_a_probar:
             logging.info(f"--- INICIANDO OPTIMIZACIÓN PARA: {nombre_modelo} ---")
             study = optuna.create_study(direction='minimize')
-            objective_func = objective_factory(nombre_modelo, features_data)
-            study.optimize(objective_func, n_trials=N_TRIALS_OPTUNA)
+            # Reducir n_trials si el tiempo es un problema, ya que RF y GBR pueden ser más lentos
+            n_trials = N_TRIALS_OPTUNA if nombre_modelo in ['LightGBM', 'XGBoost'] else 30
+            
+            objective_func = objective_factory(nombre_modelo, features_data_train_val)
+            study.optimize(objective_func, n_trials=n_trials)
             
             best_params = study.best_params
-            _, breach_pct, max_error = evaluar_combinacion(features_data, nombre_modelo, best_params, PARAMETROS_QUANTILES_OPTIMOS)
+            score, breach_pct, max_error = evaluar_combinacion(features_data_train_val, nombre_modelo, best_params, PARAMETROS_QUANTILES_OPTIMOS)
             
             resultado = {
                 'modelo': nombre_modelo, 
-                'best_params': best_params, 
+                'best_params': best_params,
+                'score_optimizado': score,
                 'breach_pct_optimizado': breach_pct, 
                 'max_error_optimizado': max_error
             }
             campeones_de_cada_modelo.append(resultado)
-            
-            # Analizar importancia de features del mejor modelo
-            features_to_use = ['volatility_21d', 'atr_14d', 'vix_level', 'momentum_21d', 'momentum_63d', 'momentum_126d', 'vix_vol_ratio']
-            train_df = features_data.dropna(subset=['target_lower_pct'])
-            X_train, y_train = train_df[features_to_use], train_df['target_lower_pct']
-            
-            if nombre_modelo == 'LightGBM':
-                model_final = lgb.LGBMRegressor(objective='quantile', alpha=PARAMETROS_QUANTILES_OPTIMOS[0], **best_params).fit(X_train, y_train)
-                analizar_importancia_features(model_final, X_train, nombre_modelo)
-
 
         df_campeones = pd.DataFrame(campeones_de_cada_modelo)
         
-        ## NUEVA MEJORA: SELECCIÓN DE ENSAMBLE ##
         logging.info("--- SELECCIONANDO ENSAMBLE DE CAMPEONES ---")
-        target_breach = (PARAMETROS_QUANTILES_OPTIMOS[0] + (1 - PARAMETROS_QUANTILES_OPTIMOS[1])) * 100
-        df_campeones['score'] = abs(df_campeones['breach_pct_optimizado'] - target_breach) + (df_campeones['max_error_optimizado'] / 10)
-        df_campeones_validos = df_campeones[df_campeones['max_error_optimizado'] < 20.0].sort_values(by='score')
+        df_campeones_validos = df_campeones[df_campeones['max_error_optimizado'] < 20.0].sort_values(by='score_optimizado')
 
         if len(df_campeones_validos) < 2:
             raise ValueError("No se encontraron suficientes modelos válidos para crear un ensamble.")
 
         ensamble_final = df_campeones_validos.head(2).to_dict('records')
-        print("\n🏆 ENSAMBLE GANADOR (2 MEJORES MODELOS) 🏆:")
-        print(ensamble_final)
-
-        # Guardar la configuración del ensamble
+        print("\n🏆 RESULTADOS DE LA COMPETENCIA DE MODELOS 🏆:")
+        print(df_campeones.to_string())
+        
         ensamble_a_guardar = {
             'ensemble_models': ensamble_final,
             'quantiles': PARAMETROS_QUANTILES_OPTIMOS
         }
         
-        # Corregir tipos de datos antes de guardar
-        for model_config in ensamble_a_guardar['ensemble_models']:
-            params_dict = model_config['best_params']
-            int_params = ['n_estimators', 'num_leaves', 'max_depth', 'min_samples_leaf']
-            for param in int_params:
-                if param in params_dict:
-                    params_dict[param] = int(params_dict[param])
-
-        with open('ensemble_champion.json', 'w') as f:
+        with open('ensemble_champion_v3.json', 'w') as f:
             json.dump(ensamble_a_guardar, f, indent=4)
-        logging.info("✅ Parámetros del ensamble campeón guardados en 'ensemble_champion.json'")
+        logging.info("✅ Parámetros del ensamble campeón guardados en 'ensemble_champion_v3.json'")
