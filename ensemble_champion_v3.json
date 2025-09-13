@@ -1,0 +1,30 @@
+{
+    "ensemble_models": [
+        {
+            "modelo": "XGBoost",
+            "best_params": {
+                "n_estimators": 117,
+                "learning_rate": 0.03196994385311834,
+                "max_depth": 3
+            },
+            "score_optimizado": 1.0038818668875844,
+            "breach_pct_optimizado": 4.0,
+            "max_error_optimizado": 0.03881866887585747
+        },
+        {
+            "modelo": "GradientBoosting",
+            "best_params": {
+                "n_estimators": 141,
+                "learning_rate": 0.02573115137695941,
+                "max_depth": 4
+            },
+            "score_optimizado": 1.0100317534957948,
+            "breach_pct_optimizado": 4.0,
+            "max_error_optimizado": 0.1003175349579606
+        }
+    ],
+    "quantiles": [
+        0.015,
+        0.985
+    ]
+}
